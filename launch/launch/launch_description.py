@@ -17,6 +17,9 @@
 from typing import Iterable
 from typing import List
 from typing import Optional
+from typing import Text
+
+import launch.logging
 
 from .action import Action
 from .actions import DeclareLaunchArgument
@@ -45,12 +48,24 @@ class LaunchDescription(LaunchDescriptionEntity):
     def __init__(
         self,
         initial_entities: Optional[Iterable[LaunchDescriptionEntity]] = None,
+        *,
+        deprecated_reason: Optional[Text] = None
     ) -> None:
         """Constructor."""
         self.__entities = list(initial_entities) if initial_entities is not None else []
+        self.__deprecated_reason = deprecated_reason
 
     def visit(self, context: LaunchContext) -> Optional[List[LaunchDescriptionEntity]]:
         """Override visit from LaunchDescriptionEntity to visit contained entities."""
+        if self.__deprecated_reason is not None:
+            if 'current_launch_file_path' in context.get_locals_as_dict():
+                message = 'launch file [{}] is deprecated: {}'.format(
+                    context.locals.current_launch_file_path,
+                    self.__deprecated_reason,
+                )
+            else:
+                message = 'deprecated launch description: {}'.format(self.__deprecated_reason)
+            launch.logging.get_logger().warning(message)
         return self.__entities
 
     def describe_sub_entities(self) -> List[LaunchDescriptionEntity]:
@@ -89,7 +104,7 @@ class LaunchDescription(LaunchDescriptionEntity):
             for entity in entities:
                 if isinstance(entity, DeclareLaunchArgument):
                     # Avoid duplicate entries with the same name.
-                    if entity.name in [e.name for e in declared_launch_arguments]:
+                    if entity.name in (e.name for e in declared_launch_arguments):
                         continue
                     # Stuff this contextual information into the class for
                     # potential use in command-line descriptions or errors.
@@ -97,10 +112,16 @@ class LaunchDescription(LaunchDescriptionEntity):
                     entity._conditionally_included |= entity.condition is not None
                     declared_launch_arguments.append(entity)
                 else:
+                    from .actions import IncludeLaunchDescription
+                    if isinstance(entity, IncludeLaunchDescription):
+                        # Do not check launch arguments of included descriptions.
+                        continue
                     process_entities(
                         entity.describe_sub_entities(), _conditional_inclusion=False)
-                    process_entities(
-                        entity.describe_conditional_sub_entities(), _conditional_inclusion=True)
+                    for conditional_sub_entity in entity.describe_conditional_sub_entities():
+                        process_entities(
+                            conditional_sub_entity[1],
+                            _conditional_inclusion=True)
 
         process_entities(self.entities, _conditional_inclusion=conditional_inclusion)
 
@@ -118,3 +139,17 @@ class LaunchDescription(LaunchDescriptionEntity):
     def add_action(self, action: Action) -> None:
         """Add an action to the LaunchDescription."""
         self.add_entity(action)
+
+    @property
+    def deprecated(self) -> bool:
+        """Getter for deprecated."""
+        return self.__deprecated_reason is not None
+
+    @property
+    def deprecated_reason(self) -> Optional[Text]:
+        """
+        Getter for deprecated.
+
+        Returns `None` if the launch description is not deprecated.
+        """
+        return self.__deprecated_reason

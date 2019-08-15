@@ -26,7 +26,6 @@ from launch.actions import DeclareLaunchArgument
 from launch.actions import IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import ThisLaunchFileDir
 
 logging.getLogger('launch').setLevel(logging.DEBUG)
 
@@ -61,8 +60,7 @@ def test_launch_description_get_launch_arguments():
         ]))),
     ])
     la = ld.get_launch_arguments()
-    assert len(la) == 1
-    assert la[0]._conditionally_included is False
+    assert len(la) == 0
 
     this_dir = os.path.dirname(os.path.abspath(__file__))
     ld = LaunchDescription([
@@ -70,18 +68,20 @@ def test_launch_description_get_launch_arguments():
             os.path.join(this_dir, 'launch_file_with_argument.launch.py'))),
     ])
     la = ld.get_launch_arguments()
-    assert len(la) == 1
-    assert la[0]._conditionally_included is False
+    assert len(la) == 0
+
+    # From issue #144: get_launch_arguments was broken when an entitity had conditional
+    # sub entities
+    class EntityWithConditional(LaunchDescriptionEntity):
+
+        def describe_conditional_sub_entities(self):
+            return [('String describing condition', [DeclareLaunchArgument('foo')])]
 
     ld = LaunchDescription([
-        IncludeLaunchDescription(PythonLaunchDescriptionSource([
-            # This will prevent loading of this launch file to find arguments in it.
-            ThisLaunchFileDir(),
-            'launch_file_with_argument.launch.py',
-        ])),
+        EntityWithConditional()
     ])
     la = ld.get_launch_arguments()
-    assert len(la) == 0
+    assert len(la) == 1
 
 
 def test_launch_description_add_things():
@@ -94,15 +94,25 @@ def test_launch_description_add_things():
     assert len(ld.entities) == 2
 
 
+class MockLaunchContext:
+
+    def get_locals_as_dict(self):
+        return {}
+
+
 def test_launch_description_visit():
     """Test visiting entities in the LaunchDescription class."""
     ld = LaunchDescription([LaunchDescriptionEntity()])
     ld.add_action(Action())
 
-    class MockLaunchContext:
-        ...
-
     result = ld.visit(MockLaunchContext())
     assert isinstance(result, collections.abc.Iterable)
     for entity in result:
         assert isinstance(entity, LaunchDescriptionEntity)
+
+
+def test_launch_description_deprecated():
+    ld = LaunchDescription(deprecated_reason='DEPRECATED MESSAGE')
+    ld.visit(MockLaunchContext())
+    assert ld.deprecated is True
+    assert ld.deprecated_reason == 'DEPRECATED MESSAGE'

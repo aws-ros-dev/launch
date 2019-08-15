@@ -18,7 +18,6 @@ import logging
 import os
 import sys
 
-from .domain_coordinator import get_coordinated_domain_id
 from .junitxml import unittestResultsToXml
 from .loader import LoadTestsFromPythonModule
 from .print_arguments import print_arguments_of_launch_description
@@ -48,11 +47,6 @@ def add_arguments(parser):
         '-s', '--show-args', '--show-arguments', action='store_true', default=False,
         help='Show arguments that may be given to the launch test.'
     )
-    # TODO(hidmic): Provide this option for rostests only.
-    parser.add_argument(
-        '-i', '--isolated', action='store_true', default=False,
-        help='Isolate tests using a custom ROS_DOMAIN_ID. Useful for test parallelization.'
-    )
     parser.add_argument(
         'launch_arguments', nargs='*',
         help="Arguments in '<name>:=<value>' format (for duplicates, last one wins)."
@@ -72,11 +66,6 @@ def parse_arguments():
 
 
 def run(parser, args, test_runner_cls=LaunchTestRunner):
-    if args.isolated:
-        domain_id = get_coordinated_domain_id()  # Must copy this to a local to keep it alive
-        _logger_.debug('Running with ROS_DOMAIN_ID {}'.format(domain_id))
-        os.environ['ROS_DOMAIN_ID'] = str(domain_id)
-
     # Load the test file as a module and make sure it has the required
     # components to run it as a launch test
     _logger_.debug("Loading tests from file '{}'".format(args.launch_test_file))

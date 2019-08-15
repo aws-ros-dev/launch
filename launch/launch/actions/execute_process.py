@@ -15,6 +15,7 @@
 """Module for the ExecuteProcess action."""
 
 import asyncio
+import io
 import os
 import platform
 import shlex
@@ -42,6 +43,7 @@ from .opaque_function import OpaqueFunction
 from .timer_action import TimerAction
 
 from ..action import Action
+from ..conditions import evaluate_condition_expression
 from ..event import Event
 from ..event_handler import EventHandler
 from ..event_handlers import OnProcessExit
@@ -57,6 +59,9 @@ from ..events.process import ProcessStdin
 from ..events.process import ProcessStdout
 from ..events.process import ShutdownProcess
 from ..events.process import SignalProcess
+from ..frontend import Entity
+from ..frontend import expose_action
+from ..frontend import Parser
 from ..launch_context import LaunchContext
 from ..launch_description import LaunchDescription
 from ..some_actions_type import SomeActionsType
@@ -64,6 +69,7 @@ from ..some_substitutions_type import SomeSubstitutionsType
 from ..substitution import Substitution  # noqa: F401
 from ..substitutions import LaunchConfiguration
 from ..substitutions import PythonExpression
+from ..substitutions import TextSubstitution
 from ..utilities import create_future
 from ..utilities import is_a_subclass
 from ..utilities import normalize_to_list_of_substitutions
@@ -73,6 +79,7 @@ _global_process_counter_lock = threading.Lock()
 _global_process_counter = 0  # in Python3, this number is unbounded (no rollover)
 
 
+@expose_action('executable')
 class ExecuteProcess(Action):
     """Action that begins executing a process and sets up event handlers for the process."""
 
@@ -89,6 +96,7 @@ class ExecuteProcess(Action):
             'sigterm_timeout', default=5),
         sigkill_timeout: SomeSubstitutionsType = LaunchConfiguration(
             'sigkill_timeout', default=5),
+        emulate_tty: bool = False,
         prefix: Optional[SomeSubstitutionsType] = None,
         output: Text = 'log',
         output_format: Text = '[{this.name}] {line}',
@@ -167,6 +175,12 @@ class ExecuteProcess(Action):
             as a string or a list of strings and Substitutions to be resolved
             at runtime, defaults to the LaunchConfiguration called
             'sigkill_timeout'
+        :param: emulate_tty emulate a tty (terminal), defaults to False, but can
+            be overridden with the LaunchConfiguration called 'emulate_tty',
+            the value of which is evaluated as true or false according to
+            :py:func:`evaluate_condition_expression`.
+            Throws :py:exception:`InvalidConditionExpressionError` if the
+            'emulate_tty' configuration does not represent a boolean.
         :param: prefix a set of commands/arguments to preceed the cmd, used for
             things like gdb/valgrind and defaults to the LaunchConfiguration
             called 'launch-prefix'
@@ -205,6 +219,7 @@ class ExecuteProcess(Action):
         self.__shell = shell
         self.__sigterm_timeout = normalize_to_list_of_substitutions(sigterm_timeout)
         self.__sigkill_timeout = normalize_to_list_of_substitutions(sigkill_timeout)
+        self.__emulate_tty = emulate_tty
         self.__prefix = normalize_to_list_of_substitutions(
             LaunchConfiguration('launch-prefix', default='') if prefix is None else prefix
         )
@@ -221,6 +236,67 @@ class ExecuteProcess(Action):
         self.__sigterm_timer = None  # type: Optional[TimerAction]
         self.__sigkill_timer = None  # type: Optional[TimerAction]
         self.__shutdown_received = False
+        self.__stdout_buffer = io.StringIO()
+        self.__stderr_buffer = io.StringIO()
+
+    @classmethod
+    def parse(
+        cls,
+        entity: Entity,
+        parser: Parser,
+        cmd_arg_name: str = 'cmd'
+    ):
+        """
+        Return the `ExecuteProcess` action and kwargs for constructing it.
+
+        :param: cmd_arg_name Allow changing the name of `cmd` tag.
+            Intended for code reuse in derived classes (e.g.: launch_ros.actions.Node).
+        """
+        _, kwargs = super().parse(entity, parser)
+
+        cmd = entity.get_attr(cmd_arg_name)
+        # `cmd` is supposed to be a list separated with ' '.
+        # All the found `TextSubstitution` items are split and
+        # added to the list again as a `TextSubstitution`.
+        cmd = parser.parse_substitution(cmd)
+        cmd_list = []
+        for arg in cmd:
+            if isinstance(arg, TextSubstitution):
+                text = arg.text
+                text = shlex.split(text)
+                text = [TextSubstitution(text=item) for item in text]
+                cmd_list.extend(text)
+            else:
+                cmd_list.append(arg)
+        kwargs[cmd_arg_name] = cmd_list
+
+        cwd = entity.get_attr('cwd', optional=True)
+        if cwd is not None:
+            kwargs['cwd'] = parser.parse_substitution(cwd)
+        name = entity.get_attr('name', optional=True)
+        if name is not None:
+            kwargs['name'] = parser.parse_substitution(name)
+        prefix = entity.get_attr('launch-prefix', optional=True)
+        if prefix is not None:
+            kwargs['prefix'] = parser.parse_substitution(prefix)
+        output = entity.get_attr('output', optional=True)
+        if output is not None:
+            kwargs['output'] = parser.escape_characters(output)
+        shell = entity.get_attr('shell', data_type=bool, optional=True)
+        if shell is not None:
+            kwargs['shell'] = shell
+        # Conditions won't be allowed in the `env` tag.
+        # If that feature is needed, `set_enviroment_variable` and
+        # `unset_enviroment_variable` actions should be used.
+        env = entity.get_attr('env', data_type=List[Entity], optional=True)
+        if env is not None:
+            env = {
+                tuple(parser.parse_substitution(e.get_attr('name'))):
+                parser.parse_substitution(e.get_attr('value')) for e in env
+            }
+            kwargs['additional_env'] = env
+
+        return cls, kwargs
 
     @property
     def output(self):
@@ -314,18 +390,54 @@ class ExecuteProcess(Action):
     def __on_process_stdout(
         self, event: ProcessIO
     ) -> Optional[SomeActionsType]:
-        for line in event.text.decode(errors='replace').splitlines():
-            self.__stdout_logger.info(
-                self.__output_format.format(line=line, this=self)
-            )
+        self.__stdout_buffer.write(event.text.decode(errors='replace'))
+        self.__stdout_buffer.seek(0)
+        last_line = None
+        for line in self.__stdout_buffer:
+            if line.endswith(os.linesep):
+                self.__stdout_logger.info(
+                    self.__output_format.format(line=line[:-len(os.linesep)], this=self)
+                )
+            else:
+                last_line = line
+                break
+        self.__stdout_buffer.seek(0)
+        self.__stdout_buffer.truncate(0)
+        if last_line is not None:
+            self.__stdout_buffer.write(last_line)
 
     def __on_process_stderr(
         self, event: ProcessIO
     ) -> Optional[SomeActionsType]:
-        for line in event.text.decode(errors='replace').splitlines():
-            self.__stderr_logger.info(
-                self.__output_format.format(line=line, this=self)
-            )
+        self.__stderr_buffer.write(event.text.decode(errors='replace'))
+        self.__stderr_buffer.seek(0)
+        last_line = None
+        for line in self.__stderr_buffer:
+            if line.endswith(os.linesep):
+                self.__stderr_logger.info(
+                    self.__output_format.format(line=line[:-len(os.linesep)], this=self)
+                )
+            else:
+                last_line = line
+                break
+        self.__stderr_buffer.seek(0)
+        self.__stderr_buffer.truncate(0)
+        if last_line is not None:
+            self.__stderr_buffer.write(last_line)
+
+    def __flush_buffers(self, event, context):
+        with self.__stdout_buffer as buf:
+            line = buf.getvalue()
+            if line != '':
+                self.__stdout_logger.info(
+                    self.__output_format.format(line=line, this=self)
+                )
+        with self.__stderr_buffer as buf:
+            line = buf.getvalue()
+            if line != '':
+                self.__stderr_logger.info(
+                    self.__output_format.format(line=line, this=self)
+                )
 
     def __on_shutdown(self, event: Event, context: LaunchContext) -> Optional[SomeActionsType]:
         return self._shutdown_process(
@@ -474,6 +586,16 @@ class ExecuteProcess(Action):
             self.__logger.info("process details: cmd=[{}], cwd='{}', custom_env?={}".format(
                 ', '.join(cmd), cwd, 'True' if env is not None else 'False'
             ))
+
+        emulate_tty = self.__emulate_tty
+        if 'emulate_tty' in context.launch_configurations:
+            emulate_tty = evaluate_condition_expression(
+                context,
+                normalize_to_list_of_substitutions(
+                    context.launch_configurations['emulate_tty']
+                ),
+            )
+
         try:
             transport, self._subprocess_protocol = await async_execute_process(
                 lambda **kwargs: self.__ProcessProtocol(
@@ -483,7 +605,7 @@ class ExecuteProcess(Action):
                 cwd=cwd,
                 env=env,
                 shell=self.__shell,
-                emulate_tty=False,
+                emulate_tty=emulate_tty,
                 stderr_to_stdout=False,
             )
         except Exception:
@@ -544,6 +666,10 @@ class ExecuteProcess(Action):
                 target_action=self,
                 on_exit=self.__on_exit,
             ),
+            OnProcessExit(
+                target_action=self,
+                on_exit=self.__flush_buffers,
+            ),
         ]
         for event_handler in event_handlers:
             context.register_event_handler(event_handler)
@@ -594,3 +720,8 @@ class ExecuteProcess(Action):
     def shell(self):
         """Getter for shell."""
         return self.__shell
+
+    @property
+    def prefix(self):
+        """Getter for prefix."""
+        return self.__prefix
